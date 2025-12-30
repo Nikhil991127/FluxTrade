@@ -2,10 +2,9 @@ const express = require("express");
 const router = express.Router();
 
 const YahooFinance = require("yahoo-finance2").default;
-const fetch = require("node-fetch");
 
 const yahooFinance = new YahooFinance({
-  fetch,
+  fetch: global.fetch,
   suppressNotices: ["ripHistorical"],
 });
 
@@ -90,4 +89,3 @@ router.post("/predict", async (req, res) => {
 });
 
 module.exports = router;
-
