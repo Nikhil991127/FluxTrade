@@ -2,33 +2,33 @@ const express = require("express");
 const router = express.Router();
 
 const YahooFinance = require("yahoo-finance2").default;
+const fetch = require("node-fetch");
+
 const yahooFinance = new YahooFinance({
+  fetch,
   suppressNotices: ["ripHistorical"],
 });
 
 const { spawn } = require("child_process");
-
 const PYTHON_BIN = process.env.PYTHON_BIN || "python";
 
-// Fetch 6 months historical data from Yahoo Finance
+// Fetch 6 months historical data
 async function fetchYahooDaily(symbol) {
   try {
-    // last 6 months
-    const period2 = new Date();               // today
-    const period1 = new Date(period2);        
-    period1.setMonth(period1.getMonth() - 6); // 6 months ago
+    const period2 = new Date();
+    const period1 = new Date(period2);
+    period1.setMonth(period1.getMonth() - 6);
 
     const result = await yahooFinance.chart(symbol, {
-      period1: period1,
-      period2: period2,
+      period1,
+      period2,
       interval: "1d",
     });
 
-    if (!result || !result.quotes || result.quotes.length === 0) {
-      throw new Error("No historical data found for this symbol.");
+    if (!result?.quotes?.length) {
+      throw new Error("No historical data found");
     }
 
-    // normalize output for ML model
     return result.quotes.map((q) => ({
       date: q.date.toISOString().split("T")[0],
       close: q.close,
@@ -45,17 +45,12 @@ async function fetchYahooDaily(symbol) {
 router.post("/predict", async (req, res) => {
   try {
     const { symbol, days = 1 } = req.body;
-
-    if (!symbol) {
-      return res.status(400).json({ error: "Symbol is required" });
-    }
+    if (!symbol) return res.status(400).json({ error: "Symbol is required" });
 
     console.log("Fetching data for:", symbol);
 
-    // Fetch Yahoo data
     const histData = await fetchYahooDaily(symbol);
 
-    // Run Python ML model
     const py = spawn(PYTHON_BIN, [
       __dirname + "/../ml/predict_stock.py",
       String(days),
@@ -64,31 +59,28 @@ router.post("/predict", async (req, res) => {
     let stdout = "";
     let stderr = "";
 
-    py.stdout.on("data", (chunk) => (stdout += chunk.toString()));
-    py.stderr.on("data", (chunk) => (stderr += chunk.toString()));
+    py.stdout.on("data", (d) => (stdout += d.toString()));
+    py.stderr.on("data", (d) => (stderr += d.toString()));
 
     py.on("close", (code) => {
       if (code !== 0) {
-        console.error("Python error:", stderr);
         return res.status(500).json({
-          error: "Python prediction script failed",
+          error: "Python prediction failed",
           details: stderr,
         });
       }
 
       try {
         const parsed = JSON.parse(stdout);
-        return res.json({ success: true, ...parsed });
-      } catch (err) {
-        console.error("JSON parse error:", err);
-        return res.status(500).json({
+        res.json({ success: true, ...parsed });
+      } catch (e) {
+        res.status(500).json({
           error: "Invalid JSON from Python",
-          details: err.message,
+          details: e.message,
         });
       }
     });
 
-    // Send historical data to Python
     py.stdin.write(JSON.stringify({ historical: histData }));
     py.stdin.end();
   } catch (err) {
@@ -98,3 +90,4 @@ router.post("/predict", async (req, res) => {
 });
 
 module.exports = router;
+
