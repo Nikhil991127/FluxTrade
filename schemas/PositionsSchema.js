@@ -1,7 +1,12 @@
-const {Schema} = require("mongoose");
+const { Schema } = require("mongoose");
 
 const PositionsSchema = new Schema({
-   
+    userId: {
+        type: Schema.Types.ObjectId,
+        ref: "User",
+        required: true,
+        index: true,
+    },
     product: String,
     name: String,
     qty: Number,

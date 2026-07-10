@@ -1,61 +1,66 @@
 const express = require("express");
 const router = express.Router();
-
-const YahooFinance = require("yahoo-finance2").default;
-const yahooFinance = new YahooFinance({
-  suppressNotices: ["ripHistorical"],
-});
-
+const axios = require("axios");
 const { spawn } = require("child_process");
 
+const API_KEY = process.env.ALPHA_VANTAGE_KEY;
 const PYTHON_BIN = process.env.PYTHON_BIN || "python";
 
-// Fetch 6 months historical data from Yahoo Finance
-async function fetchYahooDaily(symbol) {
-  try {
-    // last 6 months
-    const period2 = new Date();               // today
-    const period1 = new Date(period2);        
-    period1.setMonth(period1.getMonth() - 6); // 6 months ago
+// =======================
+// Fetch stock data
+// =======================
+async function fetchStockData(symbol) {
+  const url =
+    `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${encodeURIComponent(
+      symbol.trim().toUpperCase()
+    )}&outputsize=compact&apikey=${API_KEY}`;
 
-    const result = await yahooFinance.chart(symbol, {
-      period1: period1,
-      period2: period2,
-      interval: "1d",
-    });
+  const { data } = await axios.get(url);
 
-    if (!result || !result.quotes || result.quotes.length === 0) {
-      throw new Error("No historical data found for this symbol.");
-    }
+  console.log("AlphaVantage Response:", data);
 
-    // normalize output for ML model
-    return result.quotes.map((q) => ({
-      date: q.date.toISOString().split("T")[0],
-      close: q.close,
-    }));
-  } catch (err) {
-    console.error("YAHOO FINANCE ERROR:", err);
-    throw err;
+  if (data.Note) {
+    throw new Error(data.Note);
   }
+
+  if (data.Information) {
+    throw new Error(data.Information);
+  }
+
+  if (data["Error Message"]) {
+    throw new Error(data["Error Message"]);
+  }
+
+  const series = data["Time Series (Daily)"];
+
+  if (!series) {
+    throw new Error("No historical data found.");
+  }
+
+  return Object.entries(series)
+    .map(([date, value]) => ({
+      date,
+      close: Number(value["4. close"]),
+    }))
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
 }
 
 // =======================
-// POST /api/predict
+// Prediction Route
 // =======================
 router.post("/predict", async (req, res) => {
   try {
-    const { symbol, days = 1 } = req.body;
+    const { symbol, days = 5 } = req.body;
 
     if (!symbol) {
-      return res.status(400).json({ error: "Symbol is required" });
+      return res.status(400).json({
+        success: false,
+        error: "Stock symbol is required",
+      });
     }
 
-    console.log("Fetching data for:", symbol);
+    const historical = await fetchStockData(symbol);
 
-    // Fetch Yahoo data
-    const histData = await fetchYahooDaily(symbol);
-
-    // Run Python ML model
     const py = spawn(PYTHON_BIN, [
       __dirname + "/../ml/predict_stock.py",
       String(days),
@@ -64,36 +69,61 @@ router.post("/predict", async (req, res) => {
     let stdout = "";
     let stderr = "";
 
-    py.stdout.on("data", (chunk) => (stdout += chunk.toString()));
-    py.stderr.on("data", (chunk) => (stderr += chunk.toString()));
+    py.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    py.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
 
     py.on("close", (code) => {
       if (code !== 0) {
-        console.error("Python error:", stderr);
+        console.error(stderr);
+
         return res.status(500).json({
-          error: "Python prediction script failed",
-          details: stderr,
+          success: false,
+          error: stderr || "Python prediction failed",
         });
       }
 
       try {
-        const parsed = JSON.parse(stdout);
-        return res.json({ success: true, ...parsed });
+        const output = JSON.parse(stdout);
+
+        if (output.error) {
+          return res.status(500).json({
+            success: false,
+            error: output.error,
+          });
+        }
+
+        return res.json({
+          success: true,
+          model: output.model,
+          last_known: output.last_known,
+          predictions: output.predictions,
+        });
+
       } catch (err) {
-        console.error("JSON parse error:", err);
+        console.error(stdout);
+
         return res.status(500).json({
-          error: "Invalid JSON from Python",
-          details: err.message,
+          success: false,
+          error: "Invalid JSON returned from Python",
         });
       }
     });
 
-    // Send historical data to Python
-    py.stdin.write(JSON.stringify({ historical: histData }));
+    py.stdin.write(JSON.stringify({ historical }));
     py.stdin.end();
+
   } catch (err) {
-    console.error("SERVER ERROR:", err);
-    res.status(500).json({ error: err.message });
+    console.error(err);
+
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 

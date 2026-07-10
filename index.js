@@ -8,6 +8,7 @@ const { PositionsModel } = require("./models/PositionsModel.js");
 const { OrdersModel } = require("./models/OrdersModel.js");
 const cookieParser = require("cookie-parser");
 const AuthRoute = require("./AuthRoute.js");
+const { requireAuth } = require("./middlewares/AuthMiddleware.js");
 
 const Port = process.env.PORT || 3004;
 const url = process.env.MONGO_URL;
@@ -15,111 +16,65 @@ const app = express();
 const cors = require("cors");
 const predictRoute = require("./routes/predictStock");
 
-
-
 app.use(cors({
-  origin: "*",  // ✅ Allows requests from ALL origins
+  origin: "*",
   credentials: true
 }));
 
-
 app.use(bodyParser.json());
-app.use("/api", predictRoute);
-
-
-// app.get("/addHoldings", async (req, res) => {
-//   let  allOrders =  [
-//     {
-//       name: "INFY",
-//       price: 1555.45,
-//       percent: "-1.60%",
-//       isDown: true,
-//     },
-//     {
-//       name: "ONGC",
-//       price: 116.8,
-//       percent: "-0.09%",
-//       isDown: true,
-//     },
-//     {
-//       name: "TCS",
-//       price: 3194.8,
-//       percent: "-0.25%",
-//       isDown: true,
-//     },
-//     {
-//       name: "KPITTECH",
-//       price: 266.45,
-//       percent: "3.54%",
-//       isDown: false,
-//     },
-//     {
-//       name: "QUICKHEAL",
-//       price: 308.55,
-//       percent: "-0.15%",
-//       isDown: true,
-//     },
-//     {
-//       name: "WIPRO",
-//       price: 577.75,
-//       percent: "0.32%",
-//       isDown: false,
-//     },
-//     {
-//       name: "M&M",
-//       price: 779.8,
-//       percent: "-0.01%",
-//       isDown: true,
-//     },
-//     {
-//       name: "RELIANCE",
-//       price: 2112.4,
-//       percent: "1.44%",
-//       isDown: false,
-//     },
-//     {
-//       name: "HUL",
-//       price: 512.4,
-//       percent: "1.04%",
-//       isDown: false,
-//     },
-//   ];
-//   allOrders.forEach((data) => {
-//     let newOrder = new OrdersModel({
-//     name: data.name,
-//     price: data.price,
-//     percent: data.percent,
-//     isDown: data.isDown,
-//     });
-
-//     newOrder.save();
-//     console.log("data saved");
-//   });
-
-//   res.send("aDone");
-// });
-
+app.use(express.json());
 app.use(cookieParser());
 
-app.use(express.json());
-
+app.use("/api", predictRoute);
 app.use("/", AuthRoute);
 
-app.get("/allHoldings", async(req, res)=>{
-  const allHoldings = await HoldingsModel.find();
-  res.send(allHoldings);
-})
+// ---------------------------------------------------------------------------
+// Everything below this line is a signed-in user's own trading data.
+// requireAuth sets req.userId; every query is scoped to it so each user only
+// ever sees (and can only ever modify) their own holdings/positions/orders.
+// ---------------------------------------------------------------------------
 
-app.get("/allPositions", async(req, res)=>{
-  const allPositions = await PositionsModel.find();
-  res.send(allPositions);
-})
+app.get("/allHoldings", requireAuth, async (req, res) => {
+  try {
+    const allHoldings = await HoldingsModel.find({ userId: req.userId });
+    res.json(allHoldings);
+  } catch (err) {
+    console.error("Error fetching holdings:", err);
+    res.status(500).json({ message: "Error fetching holdings" });
+  }
+});
 
-app.post("/addNewOrder", async (req, res) => {
+app.get("/allPositions", requireAuth, async (req, res) => {
+  try {
+    const allPositions = await PositionsModel.find({ userId: req.userId });
+    res.json(allPositions);
+  } catch (err) {
+    console.error("Error fetching positions:", err);
+    res.status(500).json({ message: "Error fetching positions" });
+  }
+});
+
+app.get("/allOrders", requireAuth, async (req, res) => {
+  try {
+    const allOrders = await OrdersModel.find({ userId: req.userId }).sort({ createdAt: -1 });
+    res.json(allOrders);
+  } catch (err) {
+    console.error("Error fetching orders:", err);
+    res.status(500).json({ message: "Error fetching orders" });
+  }
+});
+
+// Places a BUY or SELL order for the signed-in user, records it, and applies
+// its effect to that user's Holdings so qty / avg price / LTP update live:
+//   BUY  -> creates the holding, or adds to qty and recomputes the weighted
+//           average cost if the user already holds that stock
+//   SELL -> reduces qty (rejected if it would go negative), removing the
+//           holding entirely once qty reaches 0
+// The holding's `price` is always set to the trade price, so the "LTP"
+// column reflects the latest price the user actually traded at.
+app.post("/addNewOrder", requireAuth, async (req, res) => {
   try {
     const { name, qty, price, mode } = req.body;
-
-    console.log("📦 New order received:", req.body);
 
     if (!name || !qty || !price || !mode) {
       return res.status(400).json({
@@ -128,19 +83,79 @@ app.post("/addNewOrder", async (req, res) => {
       });
     }
 
-    const newOrder = new OrdersModel({ name, qty, price, mode });
+    const quantity = Number(qty);
+    const tradePrice = Number(price);
+    const normalizedMode = String(mode).toUpperCase();
+
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return res.status(400).json({ success: false, message: "Quantity must be a positive number" });
+    }
+    if (!Number.isFinite(tradePrice) || tradePrice <= 0) {
+      return res.status(400).json({ success: false, message: "Price must be a positive number" });
+    }
+    if (!["BUY", "SELL"].includes(normalizedMode)) {
+      return res.status(400).json({ success: false, message: "Mode must be BUY or SELL" });
+    }
+
+    const existingHolding = await HoldingsModel.findOne({ userId: req.userId, name });
+
+    if (normalizedMode === "BUY") {
+      if (existingHolding) {
+        const newQty = existingHolding.qty + quantity;
+        const newAvg =
+          (existingHolding.qty * existingHolding.avg + quantity * tradePrice) / newQty;
+
+        existingHolding.qty = newQty;
+        existingHolding.avg = newAvg;
+        existingHolding.price = tradePrice;
+        await existingHolding.save();
+      } else {
+        await HoldingsModel.create({
+          userId: req.userId,
+          name,
+          qty: quantity,
+          avg: tradePrice,
+          price: tradePrice,
+          net: "0.00%",
+          day: "0.00%",
+        });
+      }
+    } else {
+      // SELL
+      if (!existingHolding || existingHolding.qty < quantity) {
+        return res.status(400).json({
+          success: false,
+          message: `Insufficient holdings: you only hold ${existingHolding ? existingHolding.qty : 0} ${name}`,
+        });
+      }
+
+      const remainingQty = existingHolding.qty - quantity;
+
+      if (remainingQty === 0) {
+        await HoldingsModel.deleteOne({ _id: existingHolding._id });
+      } else {
+        existingHolding.qty = remainingQty;
+        existingHolding.price = tradePrice;
+        await existingHolding.save();
+      }
+    }
+
+    const newOrder = new OrdersModel({
+      userId: req.userId,
+      name,
+      qty: quantity,
+      price: tradePrice,
+      mode: normalizedMode,
+    });
     await newOrder.save();
 
-    console.log("✅ Order saved successfully:", newOrder);
-
-    // ✅ Always respond with JSON
     return res.status(200).json({
       success: true,
-      message: "Order placed successfully",
+      message: `${normalizedMode === "BUY" ? "Buy" : "Sell"} order placed successfully`,
       newOrder,
     });
   } catch (error) {
-    console.error("❌ Error saving order:", error);
+    console.error("Error placing order:", error);
     return res.status(500).json({
       success: false,
       message: "Failed to place order",
@@ -149,29 +164,9 @@ app.post("/addNewOrder", async (req, res) => {
   }
 });
 
-
-
-app.get("/allOrders", async(req, res) =>{
-  const allOrders = await OrdersModel.find({});
-  res.send(allOrders);
-})
-
 app.listen(Port, () => {
   console.log("Server started at port", Port);
 });
-
-
-// ✅ Get all orders
-app.get("/allOrders", async (req, res) => {
-  try {
-    const allOrders = await OrdersModel.find({});
-    res.status(200).json(allOrders);
-  } catch (err) {
-    console.error("Error fetching orders:", err);
-    res.status(500).json({ message: "Error fetching orders" });
-  }
-});
-
 
 mongoose.connect(url)
   .then(() => {
@@ -180,5 +175,3 @@ mongoose.connect(url)
   .catch((err) => {
     console.error("Error connecting to the database", err);
   })
-
-
